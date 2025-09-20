@@ -1,0 +1,21 @@
+# requirements.txt
+
+# Core AI & LangChain Framework
+langchain
+langchain-google-genai
+langchain-openai
+
+# Vector Database
+chromadb
+
+# Document Loaders & Processing
+pypdf
+unstructured
+pytesseract
+sentence-transformers
+
+# Web Application UI
+streamlit
+
+# Environment Variables
+python-dotenv
