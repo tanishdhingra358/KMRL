@@ -1,22 +1,20 @@
 import os
+import json
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import google.generativeai as genai
-import pytesseract
-from PIL import Image
-import fitz  # PyMuPDF
+import docx
 
 # --- SETUP ---
 app = Flask(__name__)
 load_dotenv()
-# Configure the Gemini API client with the key from your .env file
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# --- Routing Rules Dictionary ---
+# --- Routing Rules Dictionary (This will now be our single source of truth) ---
 ROUTING_RULES = {
     "Invoice": "Notify Finance Department (finance@kmrl.com)",
     "Safety Circular": "Notify Operations & Safety Departments",
@@ -25,88 +23,85 @@ ROUTING_RULES = {
     "Unclassified": "Flag for Manual Review"
 }
 
-# --- CORE FUNCTIONS ---
+# --- UNIFIED CORE FUNCTION (with a simpler prompt) ---
 
-def extract_text_with_ocr(pdf_path):
-    """Converts a scanned PDF to images and uses Tesseract to extract text."""
-    text = ""
-    try:
-        doc = fitz.open(pdf_path)
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(dpi=300)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            text += pytesseract.image_to_string(img)
-        doc.close()
-        return text
-    except Exception as e:
-        print(f"Error during OCR: {e}")
-        return None
-
-def classify_document(document_text):
-    """Uses the Gemini API to classify a document."""
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
-    prompt = f"""
-    Classify the following document into one of these categories: 'Invoice', 'Safety Circular', 'HR Policy', 'Maintenance Report'.
-    Respond with ONLY the category name. TEXT: {document_text[:8000]}
+def analyze_document_with_gemini(file_path=None, text_content=None):
     """
-    try:
-        response = model.generate_content(prompt)
-        category = response.text.strip()
-        if category in ROUTING_RULES:
-            return category
-        return "Unclassified"
-    except Exception as e:
-        print(f"An error during Gemini classification: {e}")
-        return "Classification Error"
-
-def extract_action_items(document_text):
-    """Uses the Gemini API to extract action items."""
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
-    prompt = f"""
-    Analyze the following text and extract a bulleted list of specific action items, tasks, or deadlines.
-    If there are no action items, respond with 'No specific action items found.'
-    TEXT: {document_text[:8000]}
+    Analyzes a document using Gemini 1.5 Flash for classification and action items.
     """
-    try:
-        response = model.generate_content(prompt)
-        # Split the response by newlines to create a list
-        return response.text.strip().split('\n')
-    except Exception as e:
-        print(f"An error during action item extraction: {e}")
-        return ["Error extracting action items."]
+    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    
+    # This prompt is now simpler and only asks for the category and action items.
+    prompt = """
+    You are an expert document sorter. Analyze the provided document and respond in a valid JSON format with two keys:
+    1. "predicted_category": Classify the document into one of these categories: 'Invoice', 'Safety Circular', 'HR Policy', 'Maintenance Report', or 'Unclassified'.
+    2. "extracted_action_items": A list of specific action items, tasks, or deadlines found in the document as strings. If none are found, provide an empty list [].
+    """
 
-# --- API ENDPOINT ---
+    try:
+        prompt_parts = [prompt]
+        uploaded_file = None
+
+        if text_content:
+            prompt_parts.append(text_content)
+        elif file_path:
+            uploaded_file = genai.upload_file(path=file_path)
+            prompt_parts.append(uploaded_file)
+        else:
+            return {"error": "No content provided to analyze."}
+
+        response = model.generate_content(prompt_parts)
+        
+        if uploaded_file:
+            genai.delete_file(uploaded_file.name)
+
+        clean_json_string = response.text.strip().replace("```json", "").replace("```", "")
+        return json.loads(clean_json_string)
+
+    except Exception as e:
+        print(f"An error occurred during Gemini analysis: {e}")
+        return {"error": "Failed to analyze document", "details": str(e)}
+
+# --- UPDATED API ENDPOINT (with added routing logic) ---
 @app.route('/analyze_document', methods=['POST'])
 def analyze_document_endpoint():
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
     
     file = request.files['file']
-    if file.filename == '':
+    filename = file.filename
+    if filename == '':
         return jsonify({"error": "No selected file"}), 400
 
-    if file:
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-        file.save(filepath)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
 
-        extracted_text = extract_text_with_ocr(filepath)
-        if not extracted_text:
-            return jsonify({"error": "Could not extract text from the document."}), 500
+    results = {}
+    file_extension = filename.split('.')[-1].lower()
 
-        category = classify_document(extracted_text)
-        action_items = extract_action_items(extracted_text)
-        routing_action = ROUTING_RULES.get(category, "Flag for Manual Review")
+    if file_extension == 'docx':
+        try:
+            doc = docx.Document(filepath)
+            full_text = "\n".join([para.text for para in doc.paragraphs])
+            results = analyze_document_with_gemini(text_content=full_text)
+        except Exception as e:
+            results = {"error": f"Failed to read DOCX file: {e}"}
+    
+    elif file_extension in ['pdf', 'png', 'jpg', 'jpeg']:
+        results = analyze_document_with_gemini(file_path=filepath)
+    
+    else:
+        results = {"error": f"Unsupported file type: '{file_extension}'"}
 
-        os.remove(filepath)
+    os.remove(filepath)
 
-        return jsonify({
-            "filename": file.filename,
-            "predicted_category": category,
-            "routing_action": routing_action,
-            "extracted_action_items": action_items,
-            "text_preview": extracted_text[:200] + "..."
-        })
+    # --- THIS IS THE FIX ---
+    # We now add the routing action here, based on the reliable rules dictionary.
+    if "error" not in results:
+        category = results.get("predicted_category", "Unclassified")
+        results["routing_action"] = ROUTING_RULES.get(category, "Flag for Manual Review")
+
+    return jsonify(results)
 
 # --- RUN THE APP ---
 if __name__ == '__main__':
