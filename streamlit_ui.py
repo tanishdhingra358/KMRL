@@ -13,7 +13,7 @@ st.title("📄 KMRL Intelligent Document Hub")
 st.write("Upload a scanned document (PDF) to automatically classify it and extract key information.")
 
 # File uploader
-uploaded_file = st.file_uploader("Choose a PDF file...", type="pdf")
+uploaded_file = st.file_uploader("Choose a document to analyze...", type=['pdf', 'png', 'jpg', 'jpeg', 'docx'])
 
 if uploaded_file is not None:
     st.info(f"File uploaded: {uploaded_file.name}")
